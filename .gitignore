@@ -1,0 +1,27 @@
+# Secrets
+.env
+*.env
+
+# Claude Code internals
+.claude/
+
+# Backups
+.bkp/
+
+# Source repos (submodules not needed here)
+claude-cookbooks/
+docs/
+prompt-eng-interactive-tutorial/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
