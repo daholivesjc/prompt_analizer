@@ -7,13 +7,18 @@ Uso:
   python prompt_evaluator.py "Seu prompt aqui"
   python prompt_evaluator.py -f meu_prompt.txt
   python prompt_evaluator.py --interactive
+  python prompt_evaluator.py "..." --model google/gemini-2.5-flash
+  python prompt_evaluator.py "..." --json resultado.json
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import textwrap
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -27,8 +32,19 @@ load_dotenv()
 
 GUIDE_PATH = Path(__file__).parent / "PROMPT_ENGINEERING_GUIDE.md"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-GEMINI_MODEL = "google/gemini-2.0-flash-001"
-GUIDE_MAX_CHARS = 18000  # resumo focado nas regras, não no tutorial completo
+DEFAULT_MODEL = "google/gemini-2.0-flash-001"
+
+
+@dataclass
+class Config:
+    model: str = DEFAULT_MODEL
+    guide_max_chars: int = 60000  # Gemini tem 1M tokens — cobre o guia completo extraído (~44k chars)
+    temperature: float = 0.1
+    max_tokens: int = 4096         # Call 1: análise (JSON compacto, ~1k tokens)
+    max_tokens_improvement: int = 8192  # Call 2: inclui reescrita completa do prompt
+    max_retries: int = 2
+    retry_delay: float = 2.0
+
 
 DIMENSIONS = [
     "clareza_e_diretividade",
@@ -38,7 +54,9 @@ DIMENSIONS = [
     "contexto_e_papel",
     "few_shot_e_exemplos",
     "chain_of_thought",
+    "raciocinio_avancado",
     "seguranca_e_guardrails",
+    "producao_e_robustez",
 ]
 
 DIMENSION_LABELS = {
@@ -49,7 +67,9 @@ DIMENSION_LABELS = {
     "contexto_e_papel": "Contexto e Role Prompting",
     "few_shot_e_exemplos": "Few-Shot / Exemplos",
     "chain_of_thought": "Chain of Thought / Precognição",
+    "raciocinio_avancado": "Raciocínio Avançado (ToT / Self-Ask / Reflection)",
     "seguranca_e_guardrails": "Segurança e Guardrails",
+    "producao_e_robustez": "Produção e Robustez",
 }
 
 # ---------------------------------------------------------------------------
@@ -60,7 +80,9 @@ EVALUATOR_SYSTEM = """Você é um especialista sênior em Engenharia de Prompts 
 das melhores práticas para LLMs. Sua função é avaliar prompts de forma técnica, objetiva e construtiva,
 identificando gaps e propondo melhorias concretas.
 
-Você tem acesso a um guia completo de engenharia de prompts que serve como base de conhecimento para sua avaliação."""
+Você tem acesso a um guia completo de engenharia de prompts que serve como base de conhecimento para sua
+avaliação. Use o framework CASTROFF (Constraints, Audience, Structure, Tone, Role, Output Format, Focus,
+Function) como lente de diagnóstico ao avaliar cada dimensão."""
 
 ANALYSIS_PROMPT_TEMPLATE = """
 ## Guia de Referência para Avaliação
@@ -128,11 +150,23 @@ Avalie o prompt acima com base no guia de referência. Retorne APENAS um JSON v�
       "gaps": ["<gap principal>"],
       "sugestoes": ["<sugestão concreta>"]
     }},
+    "raciocinio_avancado": {{
+      "nota": <0-10>,
+      "status": "<ok|atenção|crítico>",
+      "gaps": ["<gap se Tree-of-Thought, Self-Ask ou Reflection seriam aplicáveis e estão ausentes>"],
+      "sugestoes": ["<sugestão concreta de estratégia de raciocínio>"]
+    }},
     "seguranca_e_guardrails": {{
       "nota": <0-10>,
       "status": "<ok|atenção|crítico>",
       "gaps": ["<gap principal>"],
       "sugestoes": ["<sugestão concreta>"]
+    }},
+    "producao_e_robustez": {{
+      "nota": <0-10>,
+      "status": "<ok|atenção|crítico>",
+      "gaps": ["<gap se instrução crítica está no meio do prompt (lost-in-the-middle), se falta saída de emergência, se o prompt é frágil a perturbações>"],
+      "sugestoes": ["<sugestão concreta de posicionamento ou robustez>"]
     }}
   }},
   "top3_prioridades": [
@@ -146,6 +180,8 @@ Regras:
 - Seja técnico e específico — evite generalizações como "melhore a clareza"
 - Se uma dimensão não se aplica, atribua nota 7 e status "ok"
 - "crítico" apenas para gaps que comprometem significativamente o resultado
+- Para raciocinio_avancado: avalie se a tarefa se beneficiaria de ToT, Self-Ask ou Reflection
+- Para producao_e_robustez: verifique se instruções críticas estão no início/fim (não no meio)
 """
 
 IMPROVEMENT_PROMPT_TEMPLATE = """
@@ -199,12 +235,11 @@ def build_client() -> OpenAI:
     )
 
 
-def load_guide() -> str:
+def load_guide(config: Config) -> str:
     if not GUIDE_PATH.exists():
         sys.exit(f"[ERRO] Guia não encontrado: {GUIDE_PATH}")
     content = GUIDE_PATH.read_text(encoding="utf-8")
 
-    # Extrai apenas as seções relevantes para avaliação (descarta exemplos de código extensos)
     keep_sections = [
         "## 3. Regra de Ouro",
         "## 4. Role Prompting",
@@ -218,6 +253,12 @@ def load_guide() -> str:
         "## 17. Segurança e Guardrails",
         "## 19. Anti-Padrões",
         "## 20. Checklist",
+        # Seções novas (guia v2.0)
+        "## 21. Variações Avançadas de Chain-of-Thought",
+        "## 23. CASTROFF Framework",
+        "## 24. Protocolo de Debugging de Prompts",
+        "## 25. Segurança Avançada: Taxonomia",
+        "## 27. Conceitos Fundamentais Avançados",
     ]
 
     lines = content.splitlines()
@@ -236,53 +277,75 @@ def load_guide() -> str:
         if capturing:
             selected.append(line)
 
-    guide = "\n".join(selected)
-
-    # Garante que não ultrapassa o limite configurado
-    return guide[:GUIDE_MAX_CHARS]
+    return "\n".join(selected)[: config.guide_max_chars]
 
 
 def _parse_json(raw: str) -> dict:
     raw = raw.strip()
+    # Remove markdown fences
     if raw.startswith("```"):
         raw = raw.split("```", 1)[1]
         if raw.startswith("json"):
             raw = raw[4:]
     if raw.endswith("```"):
         raw = raw[: raw.rfind("```")]
-    return json.loads(raw.strip())
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Fallback: extrai o primeiro objeto JSON via regex
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise
 
 
-def _chat(client: OpenAI, user_message: str) -> str:
-    response = client.chat.completions.create(
-        model=GEMINI_MODEL,
-        temperature=0.1,
-        max_tokens=4096,
-        messages=[
-            {"role": "system", "content": EVALUATOR_SYSTEM},
-            {"role": "user", "content": user_message},
-        ],
-    )
-    return response.choices[0].message.content.strip()
+def _chat(client: OpenAI, user_message: str, config: Config, max_tokens: int | None = None) -> str:
+    tokens = max_tokens if max_tokens is not None else config.max_tokens
+    last_exc: Exception | None = None
+    for attempt in range(config.max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=config.model,
+                temperature=config.temperature,
+                max_tokens=tokens,
+                messages=[
+                    {"role": "system", "content": EVALUATOR_SYSTEM},
+                    {"role": "user", "content": user_message},
+                ],
+            )
+            choice = response.choices[0]
+            finish = choice.finish_reason
+            if finish == "length":
+                raise ValueError(
+                    f"Resposta truncada pelo modelo (finish_reason=length, max_tokens={tokens}). "
+                    f"Use --model google/gemini-2.5-flash ou aumente max_tokens."
+                )
+            return choice.message.content.strip()
+        except Exception as e:
+            last_exc = e
+            if attempt < config.max_retries:
+                time.sleep(config.retry_delay)
+    raise last_exc  # type: ignore[misc]
 
 
-def call_gemini(client: OpenAI, guide: str, prompt: str) -> dict:
-    # Chamada 1: análise das dimensões (saída compacta, sem prompt reescrito)
+def call_gemini(client: OpenAI, guide: str, prompt: str, config: Config) -> dict:
+    # Chamada 1: análise das dimensões
     analysis_msg = ANALYSIS_PROMPT_TEMPLATE.format(
         guide_content=guide,
         prompt_to_evaluate=prompt,
     )
-    raw_analysis = _chat(client, analysis_msg)
+    raw_analysis = _chat(client, analysis_msg, config)
     result = _parse_json(raw_analysis)
 
-    # Chamada 2: prompt melhorado (entrada menor, saída focada)
+    # Chamada 2: prompt melhorado — usa max_tokens_improvement (reescrita pode ser grande)
     diagnosis = json.dumps(result.get("top3_prioridades", []), ensure_ascii=False)
     improvement_msg = IMPROVEMENT_PROMPT_TEMPLATE.format(
-        guide_content=guide[:8000],  # guia menor para esta chamada
+        guide_content=guide,
         prompt_to_evaluate=prompt,
         diagnosis=diagnosis,
     )
-    raw_improvement = _chat(client, improvement_msg)
+    raw_improvement = _chat(client, improvement_msg, config, max_tokens=config.max_tokens_improvement)
     improvement = _parse_json(raw_improvement)
 
     result["prompt_melhorado"] = improvement.get("prompt_melhorado", "")
@@ -334,7 +397,7 @@ def hr(char: str = "─", width: int = 72) -> str:
     return DIM + char * width + RESET
 
 
-def print_report(data: dict, prompt_original: str) -> None:
+def print_report(data: dict, prompt_original: str, config: Config) -> None:
     nota = data["nota_geral"]
     nota_color = color_for_score(nota)
 
@@ -403,16 +466,15 @@ def print_report(data: dict, prompt_original: str) -> None:
     explicacao = data.get("explicacao_melhorias", "")
     if explicacao:
         print(f"  {BOLD}Principais melhorias aplicadas:{RESET}")
-        # Aceita string (com quebras de linha) ou lista de strings
         if isinstance(explicacao, list):
             items = explicacao
         else:
-            items = [l.strip() for l in explicacao.splitlines() if l.strip()]
+            items = [ln.strip() for ln in explicacao.splitlines() if ln.strip()]
         for item in items:
             print(wrap(item, width=70, indent="  "))
     print()
     print(hr("═"))
-    print(f"  {DIM}Modelo: {GEMINI_MODEL} via OpenRouter{RESET}")
+    print(f"  {DIM}Modelo: {config.model} via OpenRouter{RESET}")
     print(hr("═"))
     print()
 
@@ -434,12 +496,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Avaliador de Prompts com Gemini via OpenRouter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""
+        epilog=textwrap.dedent(f"""
             Exemplos:
               python prompt_evaluator.py "Resuma este texto"
               python prompt_evaluator.py -f meu_prompt.txt
               python prompt_evaluator.py --interactive
+              python prompt_evaluator.py "..." --model google/gemini-2.5-flash
               python prompt_evaluator.py "..." --json resultado.json
+
+            Modelos disponíveis via OpenRouter:
+              {DEFAULT_MODEL}  (padrão)
+              google/gemini-2.5-flash
+              google/gemini-2.5-pro
         """),
     )
     parser.add_argument(
@@ -466,8 +534,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default=GEMINI_MODEL,
-        help=f"Modelo Gemini via OpenRouter (padrão: {GEMINI_MODEL})",
+        default=DEFAULT_MODEL,
+        metavar="MODELO",
+        help=f"Modelo Gemini via OpenRouter (padrão: {DEFAULT_MODEL})",
     )
     return parser
 
@@ -501,32 +570,33 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    global GEMINI_MODEL
-    GEMINI_MODEL = args.model
+    config = Config(model=args.model)
 
     prompt_text = get_prompt_text(args)
-
     if not prompt_text:
         sys.exit("[ERRO] Prompt vazio.")
 
     print(f"\n{DIM}Carregando guia de referência...{RESET}")
-    guide = load_guide()
+    guide = load_guide(config)
 
-    print(f"{DIM}Conectando ao Gemini via OpenRouter ({GEMINI_MODEL})...{RESET}")
+    print(f"{DIM}Conectando ao Gemini via OpenRouter ({config.model})...{RESET}")
     client = build_client()
 
     print(f"{DIM}Avaliando prompt ({len(prompt_text)} caracteres) em 2 chamadas...{RESET}\n")
 
     try:
-        result = call_gemini(client, guide, prompt_text)
+        result = call_gemini(client, guide, prompt_text, config)
     except json.JSONDecodeError as e:
         print(f"\n[ERRO] Resposta do modelo não é JSON válido: {e}")
-        print("[DICA] O modelo pode ter excedido o limite de tokens. Tente --model google/gemini-2.5-flash")
+        print("[DICA] Tente --model google/gemini-2.5-flash para maior capacidade de raciocínio")
+        sys.exit(1)
+    except ValueError as e:
+        print(f"\n[ERRO] {e}")
         sys.exit(1)
     except Exception as e:
         sys.exit(f"[ERRO] Falha na chamada à API: {e}")
 
-    print_report(result, prompt_text)
+    print_report(result, prompt_text, config)
 
     if args.json:
         save_json(result, args.json)
